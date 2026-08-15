@@ -90,7 +90,12 @@ jobs:
       ARCH:          ${{ github.event.client_payload.arch          || '' }}
       SIGNED:        ${{ github.event.client_payload.signed        || 'false' }}
       RUNNER_NAME:   ${{ vars.RUNNER_NAME || 'github-actions' }}
-      CRAFVY_URL:    ${{ vars.CRAFVY_URL }}
+      # Callback base URL comes from the dispatch payload first so
+      # each platform instance (dev/staging/prod) points the runner
+      # at itself — one workflow, N environments, no repo-variable
+      # flipping. Falls back to CRAFVY_URL for manual workflow_dispatch
+      # runs which have no payload.
+      CRAFVY_URL:    ${{ github.event.client_payload.callbackUrl || vars.CRAFVY_URL }}
       CRAFVY_SECRET: ${{ secrets.CRAFVY_BUILD_SECRET }}
       # sourceRef: use `sourceRef` from the dispatch client_payload if
       # the platform started including it (future-proofing — the
