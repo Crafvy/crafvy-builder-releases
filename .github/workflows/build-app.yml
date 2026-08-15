@@ -201,6 +201,9 @@ jobs:
           '
 
       # ─── 4. Fetch signing material (only if this is a signed build) ─
+      # Field names below MUST match what the editor puts into the
+      # credential blob — see src/components/apps/app-publication-editor.tsx
+      # createCred() blob shape.
       - name: Fetch signing material
         if: env.SIGNED == 'true'
         shell: bash
@@ -211,26 +214,35 @@ jobs:
           RESP="$(curl -fSs "$CRAFVY_URL/api/apps/builds/$BUILD_ID/signing-material" \
             -H "X-Build-Signature: $SIG" \
             -H "X-Build-Runner: $RUNNER_NAME")"
-          echo "$RESP" | jq -r '.data.material' > work/signing/blob.json
+          echo "$RESP" | jq -e '.data.material' > work/signing/blob.json
           echo "$RESP" | jq -r '.data.platform' > work/signing/platform.txt
           echo "Signing material fetched for $(cat work/signing/platform.txt)"
           case "$(cat work/signing/platform.txt)" in
-            apple_ios|apple_macos)
-              jq -r '.apiKeyP8'     work/signing/blob.json > work/signing/api.p8
-              jq -r '.certP12'      work/signing/blob.json | base64 -d > work/signing/cert.p12
-              jq -r '.certPassword' work/signing/blob.json > work/signing/cert.pw
-              jq -r '.teamId'       work/signing/blob.json > work/signing/team.id
-              jq -r '.keyId'        work/signing/blob.json > work/signing/key.id
+            apple)
+              jq -r '.apiKeyP8'                  work/signing/blob.json > work/signing/api.p8
+              jq -r '.distributionCertP12'       work/signing/blob.json | base64 -d > work/signing/cert.p12
+              jq -r '.distributionCertPassword'  work/signing/blob.json > work/signing/cert.pw
+              jq -r '.teamId'                    work/signing/blob.json > work/signing/team.id
+              jq -r '.appStoreConnectKeyId'      work/signing/blob.json > work/signing/key.id
+              # provisioning profile only needed for iOS; harmless on macOS
+              jq -r '.provisioningProfile // empty' work/signing/blob.json | base64 -d > work/signing/profile.mobileprovision || true
               ;;
-            google_play)
+            google)
               jq -r '.serviceAccountJson' work/signing/blob.json > work/signing/play.json
-              jq -r '.keystore'           work/signing/blob.json | base64 -d > work/signing/upload.jks
+              jq -r '.keystoreJks'        work/signing/blob.json | base64 -d > work/signing/upload.jks
               jq -r '.keystorePassword'   work/signing/blob.json > work/signing/upload.pw
               jq -r '.keyAlias'           work/signing/blob.json > work/signing/upload.alias
               jq -r '.keyPassword'        work/signing/blob.json > work/signing/upload.keypw
               ;;
+            macos-developer-id|windows-authenticode)
+              # Reserved for future signing platforms — desktop code-sign
+              # variants that don't go through App Store. Cred structure
+              # will be defined when we add UI for them.
+              echo "::error::Signing platform '$(cat work/signing/platform.txt)' has no runner support yet"
+              exit 1
+              ;;
             *)
-              echo "::error::Unknown signing platform"
+              echo "::error::Unknown signing platform: $(cat work/signing/platform.txt)"
               exit 1
               ;;
           esac
@@ -241,8 +253,17 @@ jobs:
         with:
           node-version: '20'
       - name: Install Rust (Tauri)
-        if: env.PLATFORM != 'ios' && env.PLATFORM != 'android'
         uses: dtolnay/rust-toolchain@stable
+        with:
+          # iOS: Rust needs to cross-compile to the Apple mobile targets.
+          # Android: cargo-ndk drives cross-compilation to the four
+          # Android ABIs Tauri ships for.
+          targets: >-
+            ${{
+              env.PLATFORM == 'ios'     && 'aarch64-apple-ios,aarch64-apple-ios-sim,x86_64-apple-ios'                     ||
+              env.PLATFORM == 'android' && 'aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android' ||
+                                           ''
+            }}
       - name: Install Tauri deps (Linux only)
         if: env.PLATFORM == 'linux'
         shell: bash
@@ -250,6 +271,19 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
             libappindicator3-dev librsvg2-dev libssl-dev
+      - name: Setup Java 17 (Android)
+        if: env.PLATFORM == 'android'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Setup Android SDK + NDK
+        if: env.PLATFORM == 'android'
+        uses: android-actions/setup-android@v3
+        with:
+          # Match Tauri 2's default NDK target. Pin exact version so a
+          # newer Google-released NDK can't shift ABI behavior mid-week.
+          packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973'
 
       # ─── 6. Build the platform artifact ────────────────────────────
       - name: Build (desktop)
@@ -261,25 +295,125 @@ jobs:
           cargo install tauri-cli --version '^2' --locked
           cargo tauri build
 
+      # iOS build — signed + ready for App Store upload.
+      #
+      # macos-latest runners ship with recent Xcode. We:
+      #   1. Build an EPHEMERAL keychain (destroyed with the runner VM),
+      #      import the customer's .p12, tell the keychain to allow
+      #      codesign to use the key without an interactive prompt.
+      #   2. Install the .mobileprovision under its UUID so Xcode picks
+      #      it up automatically during the build.
+      #   3. Point Tauri at the team ID via env var so its generated
+      #      xcconfig signs against the right identity.
+      #   4. cargo tauri ios build --export-method app-store — Tauri
+      #      wraps xcodebuild archive + exportArchive.
+      #   5. Locate the resulting .ipa and stage it at work/artifact.ipa
+      #      for the shared upload step.
+      #
+      # Per-tenant knobs that MAY need adjustment on first customer:
+      #   - export-method: currently "app-store". Use "ad-hoc" for
+      #     TestFlight-only distribution or "development" for sideload.
+      #   - Bundle ID mismatch between .mobileprovision and
+      #     tauri.conf.json will fail signing — the descriptor's
+      #     `identifier` is written into tauri.conf.json in step 3
+      #     above, so keep the customer's App ID Prefix matching.
       - name: Build (iOS)
         if: env.PLATFORM == 'ios'
         shell: bash
         working-directory: work/src-tauri
         run: |
           set -euo pipefail
-          # TODO(tier2-ios): use fetched keychain + provisioning profile.
-          echo "::error::iOS signed builds require per-tenant setup — see TODO(tier2-ios) in build-app.yml"
-          exit 1
+          SIGNING="$GITHUB_WORKSPACE/work/signing"
 
+          # 1. Ephemeral keychain
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
+          KEYCHAIN_PW="$(openssl rand -hex 16)"
+          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+          # Prepend our keychain so codesign finds it first.
+          EXISTING="$(security list-keychains -d user | sed -E 's/\s+"?([^"]+)"?/\1/g' | tr '\n' ' ')"
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $EXISTING
+
+          # 2. Import cert + allow codesign to use it non-interactively
+          security import "$SIGNING/cert.p12" \
+            -k "$KEYCHAIN_PATH" \
+            -P "$(cat "$SIGNING/cert.pw")" \
+            -A -t cert -f pkcs12 \
+            -T /usr/bin/codesign -T /usr/bin/security
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PW" "$KEYCHAIN_PATH"
+
+          # 3. Install provisioning profile under its UUID
+          PROFILES_DIR="$HOME/Library/MobileDevice/Provisioning Profiles"
+          mkdir -p "$PROFILES_DIR"
+          if [ ! -s "$SIGNING/profile.mobileprovision" ]; then
+            echo "::error::No provisioning profile in signing material — customer must upload a .mobileprovision in the Submit tab."
+            exit 1
+          fi
+          PROFILE_UUID="$(security cms -D -i "$SIGNING/profile.mobileprovision" \
+            | plutil -extract UUID xml1 -o - - \
+            | sed -n 's/.*<string>\(.*\)<\/string>.*/\1/p' | head -1)"
+          cp "$SIGNING/profile.mobileprovision" "$PROFILES_DIR/$PROFILE_UUID.mobileprovision"
+          echo "Installed provisioning profile $PROFILE_UUID"
+
+          # 4. Build
+          cargo install tauri-cli --version '^2' --locked
+          export APPLE_DEVELOPMENT_TEAM="$(cat "$SIGNING/team.id")"
+          cargo tauri ios init
+          cargo tauri ios build --export-method app-store
+
+          # 5. Stage .ipa for the upload step
+          IPA="$(find gen/apple -type f -name '*.ipa' | head -1)"
+          if [ -z "$IPA" ]; then
+            echo "::error::iOS build produced no .ipa. Search paths:"
+            find gen/apple -type f -maxdepth 4 | head -50 || true
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/work"
+          cp "$IPA" "$GITHUB_WORKSPACE/work/artifact.ipa"
+
+      # Android build — signed .aab ready for Play Console.
+      #
+      # ubuntu runner with Android SDK/NDK installed above. Signing is
+      # pure gradle — pass the JKS + credentials via -Pandroid.injected
+      # properties which the Android Gradle Plugin picks up.
+      #
+      # Per-tenant knobs:
+      #   - Play upload track ("internal" / "alpha" / "beta" /
+      #     "production") not automated here; customer uploads the .aab
+      #     via Play Console UI or a follow-up step using play.json.
       - name: Build (Android)
         if: env.PLATFORM == 'android'
         shell: bash
         working-directory: work/src-tauri
         run: |
           set -euo pipefail
-          # TODO(tier2-android): fill in gradle signing invocation.
-          echo "::error::Android signed builds require per-tenant setup — see TODO(tier2-android) in build-app.yml"
-          exit 1
+          SIGNING="$GITHUB_WORKSPACE/work/signing"
+
+          # Tauri regenerates gen/android/ on init; safe to run each
+          # build. --ci makes tauri skip interactive prompts.
+          cargo install tauri-cli --version '^2' --locked
+          cargo tauri android init --ci
+
+          # Build the release bundle (.aab) with signing injected.
+          # Gradle properties are read by AGP's release variant.
+          cd gen/android
+          ./gradlew bundleRelease \
+            "-Pandroid.injected.signing.store.file=$SIGNING/upload.jks" \
+            "-Pandroid.injected.signing.store.password=$(cat "$SIGNING/upload.pw")" \
+            "-Pandroid.injected.signing.key.alias=$(cat "$SIGNING/upload.alias")" \
+            "-Pandroid.injected.signing.key.password=$(cat "$SIGNING/upload.keypw")"
+
+          AAB="$(find app/build/outputs/bundle -type f -name '*.aab' | head -1)"
+          if [ -z "$AAB" ]; then
+            echo "::error::Android build produced no .aab. Search paths:"
+            find app/build/outputs -type f -maxdepth 5 | head -50 || true
+            exit 1
+          fi
+          mkdir -p "$GITHUB_WORKSPACE/work"
+          cp "$AAB" "$GITHUB_WORKSPACE/work/artifact.aab"
 
       # ─── 7. Locate + upload artifact ───────────────────────────────
       - name: Locate artifact
