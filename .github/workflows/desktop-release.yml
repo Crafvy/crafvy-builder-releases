@@ -1,0 +1,404 @@
+name: Desktop Release
+
+# ─────────────────────────────────────────────────────────────────────
+# Builds the Crafvy Tauri desktop app for macOS (universal),
+# Windows (x64), and Linux (x64), then uploads the bundles as a
+# release IN THIS SAME (public) repo so anonymous users can download
+# from /download on the marketing site.
+#
+# This workflow lives in the PUBLIC releases repo. Source is checked
+# out from the PRIVATE page-builder repo via a fine-grained PAT.
+# Public-repo Actions minutes are unlimited on GitHub-hosted runners
+# → macOS/Windows/Linux builds cost $0 regardless of release cadence.
+#
+# See public-releases-repo/README.md in page-builder for setup.
+#
+# Triggered by:
+#   - repository_dispatch: desktop-release   ← fired by page-builder's
+#                                              dispatch-desktop-release.yml
+#                                              when a `desktop-v*` tag is pushed
+#   - workflow_dispatch: manual re-run with a specific tag
+#
+# Required configuration on THIS repo:
+#   Secret  PAGE_BUILDER_READ_TOKEN        Fine-grained PAT with Contents:Read
+#                                          on Crafvy/page-builder
+# Optional (auto-updater signing):
+#   Secret  TAURI_SIGNING_PRIVATE_KEY      Ed25519 private key
+#   Secret  TAURI_SIGNING_PRIVATE_KEY_PASSWORD
+# Optional (marketing-site live update):
+#   Secret  CRAFVY_RELEASE_WEBHOOK         Notifies /download
+#   Secret  CRAFVY_CHANGELOG_WEBHOOK       Notifies /changelog
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  repository_dispatch:
+    types: [desktop-release]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. desktop-v0.2.0). Must already exist in page-builder.'
+        required: true
+
+permissions:
+  # `contents: write` is enough for the built-in GITHUB_TOKEN to create
+  # the release on THIS repo — no extra PAT needed for publishing.
+  contents: write
+
+env:
+  # Tag resolution: repository_dispatch carries it in client_payload.tag,
+  # workflow_dispatch takes it from inputs. Never falls back to
+  # github.ref_name — the workflow no longer runs on tag push, and
+  # a git ref here would be `main` (useless).
+  BUILD_TAG: ${{ github.event.client_payload.tag || github.event.inputs.tag }}
+
+jobs:
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos
+            os: macos-latest
+            target: universal-apple-darwin
+            bundles: dmg
+          - platform: windows
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            bundles: msi,nsis
+          - platform: linux
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            bundles: appimage,deb
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Sanity-check dispatch payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "${BUILD_TAG:-}" ]; then
+            echo "::error::No tag in dispatch payload. Push a tag desktop-v* in page-builder or run this workflow manually with a tag input."
+            exit 1
+          fi
+          if [ -z "${{ secrets.PAGE_BUILDER_READ_TOKEN }}" ]; then
+            echo "::error::Secret PAGE_BUILDER_READ_TOKEN is not set on this repo. See public-releases-repo/README.md."
+            exit 1
+          fi
+          echo "Building tag: $BUILD_TAG"
+
+      # Check out the PRIVATE source repo at the exact tag. The token
+      # is a fine-grained PAT with Contents:Read on page-builder only
+      # (see README.md step 2).
+      - name: Checkout page-builder @ ${{ env.BUILD_TAG }}
+        uses: actions/checkout@v4
+        with:
+          repository: Crafvy/page-builder
+          token: ${{ secrets.PAGE_BUILDER_READ_TOKEN }}
+          ref: ${{ env.BUILD_TAG }}
+          # Shallow clone — Tauri build doesn't need history.
+          fetch-depth: 1
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libappindicator3-dev \
+            librsvg2-dev \
+            libxdo-dev \
+            libssl-dev \
+            patchelf \
+            file
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos' && 'aarch64-apple-darwin,x86_64-apple-darwin' || matrix.target }}
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: desktop -> target
+          key: ${{ matrix.target }}
+
+      - name: Install Tauri CLI
+        run: cargo install tauri-cli --version "^2" --locked
+
+      - name: Build Tauri bundle
+        working-directory: desktop
+        env:
+          # When set, Tauri emits *.tar.gz / *.zip updater bundles +
+          # matching .sig files alongside installers. The auto-update
+          # endpoint at /api/desktop/update reads those .sig files;
+          # without them it returns 204 to protect the desktop client
+          # from installing unverifiable updates.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: cargo tauri build --target ${{ matrix.target }} --bundles ${{ matrix.bundles }}
+
+      - name: Collect bundle artifacts
+        id: collect
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidates=(
+            "desktop/target/${{ matrix.target }}/release/bundle"
+            "desktop/src-tauri/target/${{ matrix.target }}/release/bundle"
+          )
+          out_dir=""
+          for c in "${candidates[@]}"; do
+            if [ -d "$c" ]; then out_dir="$c"; break; fi
+          done
+          if [ -z "$out_dir" ]; then
+            echo "::error::No bundle directory found."
+            for c in "${candidates[@]}"; do echo "  probed: $c"; done
+            exit 1
+          fi
+          files=()
+          while IFS= read -r -d '' f; do
+            files+=("$f")
+          done < <(find "$out_dir" -type f \( \
+              -iname "*.dmg" -o \
+              -iname "*.msi" -o \
+              -iname "*-setup.exe" -o \
+              -iname "*.AppImage" -o \
+              -iname "*.deb" -o \
+              -iname "*.app.tar.gz" -o \
+              -iname "*.app.tar.gz.sig" -o \
+              -iname "*.msi.zip" -o \
+              -iname "*.msi.zip.sig" -o \
+              -iname "*.nsis.zip" -o \
+              -iname "*.nsis.zip.sig" -o \
+              -iname "*.AppImage.tar.gz" -o \
+              -iname "*.AppImage.tar.gz.sig" \
+            \) -print0)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::No bundle artifacts found in $out_dir"
+            find "$out_dir" -maxdepth 3 -type f | head -50
+            exit 1
+          fi
+          printf 'Found:\n'; printf '  %s\n' "${files[@]}"
+          {
+            echo 'files<<EOF'
+            printf '%s\n' "${files[@]}"
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
+      # Publish to THIS repo (public). GITHUB_TOKEN is auto-injected
+      # with contents:write scope so no PAT is needed for publishing —
+      # only for reading the private source above.
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.BUILD_TAG }}
+          name: ${{ env.BUILD_TAG }}
+          draft: false
+          prerelease: false
+          fail_on_unmatched_files: true
+          files: ${{ steps.collect.outputs.files }}
+
+  # Runs ONCE after all three platform builds have finished uploading.
+  # Fetches the just-published release + POSTs a flat payload to the
+  # Crafvy Release → /download workflow so the marketing site's live
+  # download picker updates immediately.
+  #
+  # Silent no-op if CRAFVY_RELEASE_WEBHOOK isn't set.
+  notify-crafvy:
+    name: Notify Crafvy /download
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip if webhook not configured
+        id: gate
+        env:
+          WEBHOOK_URL: ${{ secrets.CRAFVY_RELEASE_WEBHOOK }}
+        run: |
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "CRAFVY_RELEASE_WEBHOOK not set — skipping /download update."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Read release + POST to Crafvy webhook
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES_REPO: ${{ github.repository }}
+          WEBHOOK_URL: ${{ secrets.CRAFVY_RELEASE_WEBHOOK }}
+          TAG: ${{ env.BUILD_TAG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#desktop-v}"
+          VERSION="${VERSION#v}"
+
+          echo "Fetching release ${TAG} from ${RELEASES_REPO}…"
+          RELEASE=$(gh api "/repos/${RELEASES_REPO}/releases/tags/${TAG}")
+
+          pick_field () {
+            local rx="$1" field="$2"
+            jq -r --arg rx "$rx" '.assets[] | select(.name | test($rx; "i")) | .'"$field" <<<"$RELEASE" | head -1
+          }
+          size_mb () {
+            python3 -c "import sys; b=int(sys.argv[1] or 0); print(round(b/1024/1024, 1))" "$1"
+          }
+
+          MAC_NAME=$(pick_field '\.dmg$' name)
+          MAC_URL=$(pick_field '\.dmg$' browser_download_url)
+          MAC_SZ=$(size_mb "$(pick_field '\.dmg$' size)")
+
+          WIN_NAME=$(pick_field 'setup\.exe$' name)
+          WIN_URL=$(pick_field 'setup\.exe$' browser_download_url)
+          WIN_SZ=$(size_mb "$(pick_field 'setup\.exe$' size)")
+          if [ -z "$WIN_NAME" ]; then
+            WIN_NAME=$(pick_field '\.msi$' name)
+            WIN_URL=$(pick_field '\.msi$' browser_download_url)
+            WIN_SZ=$(size_mb "$(pick_field '\.msi$' size)")
+          fi
+
+          LIN_NAME=$(pick_field '\.AppImage$' name)
+          LIN_URL=$(pick_field '\.AppImage$' browser_download_url)
+          LIN_SZ=$(size_mb "$(pick_field '\.AppImage$' size)")
+
+          missing=()
+          [ -z "$MAC_NAME" ] && missing+=("macOS (.dmg)")
+          [ -z "$WIN_NAME" ] && missing+=("Windows (.exe/.msi)")
+          [ -z "$LIN_NAME" ] && missing+=("Linux (.AppImage)")
+          if [ ${#missing[@]} -gt 0 ]; then
+            echo "::error::Missing assets: ${missing[*]}"
+            jq -r '.assets[] | "  " + .name' <<<"$RELEASE"
+            exit 1
+          fi
+
+          BODY=$(jq -n \
+            --arg tag "$VERSION" \
+            --arg published "$(jq -r .published_at <<<"$RELEASE")" \
+            --arg html "$(jq -r .html_url <<<"$RELEASE")" \
+            --arg mn "$MAC_NAME" --arg mu "$MAC_URL" --argjson ms "$MAC_SZ" \
+            --arg wn "$WIN_NAME" --arg wu "$WIN_URL" --argjson ws "$WIN_SZ" \
+            --arg ln "$LIN_NAME" --arg lu "$LIN_URL" --argjson ls "$LIN_SZ" \
+            '{
+              tag_name: $tag,
+              published_at: $published,
+              html_url: $html,
+              mac_filename: $mn, mac_url: $mu, mac_size_mb: $ms,
+              windows_filename: $wn, windows_url: $wu, windows_size_mb: $ws,
+              linux_filename: $ln, linux_url: $lu, linux_size_mb: $ls
+            }')
+
+          curl -sSf -X POST "$WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            --data "$BODY"
+
+          echo "✓ Crafvy /download notified for v${VERSION}"
+
+  notify-changelog:
+    name: Notify Crafvy /changelog
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Skip if webhook not configured
+        id: gate
+        env:
+          WEBHOOK_URL: ${{ secrets.CRAFVY_CHANGELOG_WEBHOOK }}
+        run: |
+          if [ -z "${WEBHOOK_URL}" ]; then
+            echo "CRAFVY_CHANGELOG_WEBHOOK not set — skipping /changelog update."
+            echo "run=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Parse release notes + POST
+        if: steps.gate.outputs.run == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASES_REPO: ${{ github.repository }}
+          WEBHOOK_URL: ${{ secrets.CRAFVY_CHANGELOG_WEBHOOK }}
+          TAG: ${{ env.BUILD_TAG }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION="${TAG#desktop-v}"
+          VERSION="${VERSION#v}"
+
+          RELEASE=$(gh api "/repos/${RELEASES_REPO}/releases/tags/${TAG}")
+          BODY_MD=$(jq -r '.body // ""' <<<"$RELEASE")
+          PUBLISHED=$(jq -r .published_at <<<"$RELEASE")
+          HTML_URL=$(jq -r .html_url <<<"$RELEASE")
+
+          ITEMS=$(python3 - <<'PY' "$BODY_MD"
+          import json, re, sys
+          body = sys.argv[1]
+          def classify(h):
+              h = h.lower()
+              if any(k in h for k in ("feature", "new", "added", "✨", "🎉")): return "feature"
+              if any(k in h for k in ("security", "🔒", "🛡")): return "security"
+              if any(k in h for k in ("fix", "bug", "🐛", "🔧")): return "fix"
+              if any(k in h for k in ("improvement", "enhance", "perf", "changed", "🚀", "⚡", "💫")): return "improvement"
+              return "improvement"
+          def clean(text):
+              text = re.sub(r"\s+by\s+@\S+", "", text)
+              text = re.sub(r"\s+in\s+https?://\S+", "", text)
+              text = re.sub(r"\s*\(#\d+\)\s*$", "", text)
+              text = re.sub(r"^\*\*(.+?)\*\*:\s*", r"\1: ", text)
+              return text.strip()[:500]
+          items = []
+          parts = re.split(r"(?m)^#{2,3}\s+(.+)$", "\n" + body)
+          for i in range(1, len(parts), 2):
+              heading = parts[i].strip()
+              section_body = parts[i + 1] if i + 1 < len(parts) else ""
+              typ = classify(heading)
+              for line in section_body.splitlines():
+                  m = re.match(r"^\s*[-*+]\s+(.+)$", line)
+                  if m:
+                      text = clean(m.group(1))
+                      if text:
+                          items.append({"type": typ, "text": text})
+          if not items:
+              for line in [l.strip() for l in body.splitlines() if l.strip() and not l.strip().startswith("#")][:3]:
+                  items.append({"type": "improvement", "text": line[:500]})
+          json.dump(items, sys.stdout)
+          PY
+          )
+
+          HIGHLIGHT=$(python3 - <<'PY' "$BODY_MD" "$VERSION"
+          import sys
+          body = sys.argv[1]; version = sys.argv[2]
+          for raw in body.splitlines():
+              line = raw.strip()
+              if not line: continue
+              if line.startswith("#") or line.startswith("-") or line.startswith("*"): continue
+              if line.startswith("**Full Changelog**"): continue
+              if line.startswith(">"): continue
+              print(line[:280]); break
+          else:
+              print(f"Release {version}")
+          PY
+          )
+
+          BODY=$(jq -n \
+            --arg tag "$VERSION" \
+            --arg date "$PUBLISHED" \
+            --arg highlight "$HIGHLIGHT" \
+            --arg notes "$BODY_MD" \
+            --arg url "$HTML_URL" \
+            --argjson items "$ITEMS" \
+            '{
+              tag_name: $tag,
+              release_date: $date,
+              highlight: $highlight,
+              notes: $notes,
+              github_release_url: $url,
+              items: $items
+            }')
+
+          curl -sSf -X POST "$WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            --data "$BODY"
+
+          echo "✓ Crafvy /changelog notified for v${VERSION}"

@@ -1,0 +1,356 @@
+name: App Build
+
+# ─────────────────────────────────────────────────────────────────────
+# Runner-side workflow for Crafvy app publications (hub apps + project
+# apps).
+#
+# This workflow lives in the PUBLIC releases repo. Source is checked
+# out from the PRIVATE page-builder repo via a fine-grained PAT.
+# Public-repo Actions minutes are unlimited on GitHub-hosted runners
+# → no per-customer macOS billing.
+#
+# See public-releases-repo/README.md in page-builder for setup.
+#
+# Fired via `repository_dispatch: app-build` from the platform (see
+# src/lib/apps/build-worker.ts → githubActionsRunner). The platform's
+# GITHUB_APP_BUILDER_REPO env var must point at Crafvy/crafvy-builder-releases
+# so events land on this repo instead of page-builder.
+#
+# Required configuration on THIS repo:
+#   Secret    PAGE_BUILDER_READ_TOKEN Fine-grained PAT with Contents:Read
+#                                     on Crafvy/page-builder
+#   Variable  CRAFVY_URL              https://app.crafvy.com
+#   Secret    CRAFVY_BUILD_SECRET     Same value as BUILD_CALLBACK_SECRET
+#                                     on the platform (HMACs both callbacks
+#                                     and the signing-material fetch)
+# Optional (defaults sane):
+#   Variable  RUNNER_NAME             Displayed in the admin build list;
+#                                     defaults to "github-actions".
+#
+# The workflow NEVER stores customer signing material in this repo's
+# secrets. Material is fetched fresh per build from the platform via
+# /api/apps/builds/{id}/signing-material and lives only in the runner's
+# scratch keychain / keystore file, which is scrubbed on both success
+# and failure paths.
+# ─────────────────────────────────────────────────────────────────────
+
+on:
+  repository_dispatch:
+    types: [app-build]
+  workflow_dispatch:
+    inputs:
+      buildId:
+        description: 'Build ID (for manual re-run of a failed build)'
+        required: true
+      platform:
+        description: 'macos | windows | linux | ios | android'
+        required: true
+      sourceRef:
+        description: 'page-builder ref to build from (default: main)'
+        required: false
+        default: 'main'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: app-build-${{ github.event.client_payload.buildId || inputs.buildId }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ github.event.client_payload.buildId || inputs.buildId }}
+    # Runner selection.
+    #
+    # Default: GitHub-hosted VM per target platform.
+    #   iOS / macOS      → macos-latest   (Xcode + notarization tools)
+    #   Windows          → windows-latest (MSBuild + signtool)
+    #   Android / Linux  → ubuntu-22.04   (Android SDK / Tauri deps)
+    #
+    # To route builds to your OWN hardware (unlimited minutes, customer
+    # P12 never leaves your building), register a self-hosted runner in
+    # this repo with a label per platform and set repo variables:
+    #   RUNS_ON_MACOS   → e.g. '["self-hosted","macOS","apple-silicon"]'
+    #   RUNS_ON_WINDOWS → e.g. '["self-hosted","Windows"]'
+    #   RUNS_ON_LINUX   → e.g. '["self-hosted","Linux","x64"]'
+    runs-on: >-
+      ${{
+        fromJSON(
+          (github.event.client_payload.platform || inputs.platform) == 'macos'   && (vars.RUNS_ON_MACOS   || '"macos-latest"')   ||
+          (github.event.client_payload.platform || inputs.platform) == 'ios'     && (vars.RUNS_ON_MACOS   || '"macos-latest"')   ||
+          (github.event.client_payload.platform || inputs.platform) == 'windows' && (vars.RUNS_ON_WINDOWS || '"windows-latest"') ||
+          (github.event.client_payload.platform || inputs.platform) == 'android' && (vars.RUNS_ON_LINUX   || '"ubuntu-22.04"')   ||
+                                                                                     (vars.RUNS_ON_LINUX   || '"ubuntu-22.04"')
+        )
+      }}
+
+    env:
+      BUILD_ID:      ${{ github.event.client_payload.buildId       || inputs.buildId }}
+      PLATFORM:      ${{ github.event.client_payload.platform      || inputs.platform }}
+      ARCH:          ${{ github.event.client_payload.arch          || '' }}
+      SIGNED:        ${{ github.event.client_payload.signed        || 'false' }}
+      RUNNER_NAME:   ${{ vars.RUNNER_NAME || 'github-actions' }}
+      CRAFVY_URL:    ${{ vars.CRAFVY_URL }}
+      CRAFVY_SECRET: ${{ secrets.CRAFVY_BUILD_SECRET }}
+      # sourceRef: use `sourceRef` from the dispatch client_payload if
+      # the platform started including it (future-proofing — the
+      # current runner doesn't pass one), else workflow_dispatch input,
+      # else `main`. NEVER falls back to github.ref_name — the
+      # workflow itself lives in the public repo, so its own ref
+      # would be `main` there, not a page-builder ref.
+      SOURCE_REF: ${{ github.event.client_payload.sourceRef || inputs.sourceRef || 'main' }}
+      # Descriptor is a JSON object; stringify + escape via toJSON so
+      # embedded quotes don't wreck the shell. Consumed as JSON inside
+      # steps that need it.
+      DESCRIPTOR_JSON: ${{ toJSON(github.event.client_payload.scopeDescriptor) }}
+
+    steps:
+      # ─── 0. Guard rails ────────────────────────────────────────────
+      - name: Sanity-check config
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -z "$CRAFVY_URL" ] || [ -z "$CRAFVY_SECRET" ]; then
+            echo "::error::CRAFVY_URL / CRAFVY_BUILD_SECRET not configured on this repo"
+            exit 1
+          fi
+          if [ -z "${{ secrets.PAGE_BUILDER_READ_TOKEN }}" ]; then
+            echo "::error::PAGE_BUILDER_READ_TOKEN not set — cannot checkout private source. See public-releases-repo/README.md."
+            exit 1
+          fi
+          if [ -z "$BUILD_ID" ]; then
+            echo "::error::No buildId in event payload"
+            exit 1
+          fi
+          echo "Build $BUILD_ID for platform $PLATFORM (signed=$SIGNED) @ page-builder ref $SOURCE_REF"
+
+      # ─── 1. Announce start ────────────────────────────────────────
+      - name: Report running
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY="$(jq -n --arg r "$RUNNER_NAME" '{status:"running", runner:$r}')"
+          SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Build-Signature: $SIG" \
+            -d "$BODY"
+
+      # ─── 2. Checkout the private page-builder source tree ─────────
+      # `desktop/src-tauri` lives there. Token is a fine-grained PAT
+      # with Contents:Read on Crafvy/page-builder only.
+      - name: Checkout page-builder @ ${{ env.SOURCE_REF }}
+        uses: actions/checkout@v4
+        with:
+          repository: Crafvy/page-builder
+          token: ${{ secrets.PAGE_BUILDER_READ_TOKEN }}
+          ref: ${{ env.SOURCE_REF }}
+          # Shallow clone — Tauri build doesn't need history.
+          fetch-depth: 1
+
+      # ─── 3. Materialize the per-build Tauri source tree ────────────
+      - name: Materialize Tauri source
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work
+          if [ ! -d desktop/src-tauri ]; then
+            echo "::error::desktop/src-tauri missing — is the page-builder checkout on the right ref?"
+            exit 1
+          fi
+          cp -R desktop/src-tauri work/src-tauri
+          node -e '
+            const fs = require("fs");
+            const d = JSON.parse(process.env.DESCRIPTOR_JSON);
+            const conf = {
+              productName: d.productName,
+              version: d.version,
+              identifier: d.identifier,
+              build: { frontendDist: `../dist-${d.identifier}` },
+              app: {
+                windows: [{
+                  title: d.window.title,
+                  width: d.window.width,
+                  height: d.window.height,
+                  minWidth: d.window.minWidth,
+                  minHeight: d.window.minHeight,
+                  url: d.startUrl + (d.startUrl.includes("?") ? "&" : "?") +
+                       "app=" + encodeURIComponent(d.identifier),
+                }],
+                security: {
+                  csp: [
+                    "default-src ${d.startUrl}",
+                    ...(d.cspAllowedOrigins || []),
+                  ].join(" ")
+                },
+              },
+              bundle: {
+                active: true,
+                targets: "all",
+                icon: d.iconPaths || ["icons/icon.png"],
+              },
+              plugins: {
+                "deep-link": {
+                  desktop: { schemes: [d.deepLinkScheme] },
+                  mobile: [{ scheme: [d.deepLinkScheme] }],
+                },
+              },
+            };
+            fs.writeFileSync("work/src-tauri/tauri.conf.json", JSON.stringify(conf, null, 2));
+            console.log("Wrote work/src-tauri/tauri.conf.json for " + d.identifier);
+          '
+
+      # ─── 4. Fetch signing material (only if this is a signed build) ─
+      - name: Fetch signing material
+        if: env.SIGNED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p work/signing
+          SIG="$(printf 'sigmat.%s' "$BUILD_ID" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          RESP="$(curl -fSs "$CRAFVY_URL/api/apps/builds/$BUILD_ID/signing-material" \
+            -H "X-Build-Signature: $SIG" \
+            -H "X-Build-Runner: $RUNNER_NAME")"
+          echo "$RESP" | jq -r '.data.material' > work/signing/blob.json
+          echo "$RESP" | jq -r '.data.platform' > work/signing/platform.txt
+          echo "Signing material fetched for $(cat work/signing/platform.txt)"
+          case "$(cat work/signing/platform.txt)" in
+            apple_ios|apple_macos)
+              jq -r '.apiKeyP8'     work/signing/blob.json > work/signing/api.p8
+              jq -r '.certP12'      work/signing/blob.json | base64 -d > work/signing/cert.p12
+              jq -r '.certPassword' work/signing/blob.json > work/signing/cert.pw
+              jq -r '.teamId'       work/signing/blob.json > work/signing/team.id
+              jq -r '.keyId'        work/signing/blob.json > work/signing/key.id
+              ;;
+            google_play)
+              jq -r '.serviceAccountJson' work/signing/blob.json > work/signing/play.json
+              jq -r '.keystore'           work/signing/blob.json | base64 -d > work/signing/upload.jks
+              jq -r '.keystorePassword'   work/signing/blob.json > work/signing/upload.pw
+              jq -r '.keyAlias'           work/signing/blob.json > work/signing/upload.alias
+              jq -r '.keyPassword'        work/signing/blob.json > work/signing/upload.keypw
+              ;;
+            *)
+              echo "::error::Unknown signing platform"
+              exit 1
+              ;;
+          esac
+          chmod -R go-rwx work/signing || true
+
+      # ─── 5. Toolchains ─────────────────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Install Rust (Tauri)
+        if: env.PLATFORM != 'ios' && env.PLATFORM != 'android'
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install Tauri deps (Linux only)
+        if: env.PLATFORM == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev \
+            libappindicator3-dev librsvg2-dev libssl-dev
+
+      # ─── 6. Build the platform artifact ────────────────────────────
+      - name: Build (desktop)
+        if: env.PLATFORM == 'macos' || env.PLATFORM == 'windows' || env.PLATFORM == 'linux'
+        shell: bash
+        working-directory: work/src-tauri
+        run: |
+          set -euo pipefail
+          cargo install tauri-cli --version '^2' --locked
+          cargo tauri build
+
+      - name: Build (iOS)
+        if: env.PLATFORM == 'ios'
+        shell: bash
+        working-directory: work/src-tauri
+        run: |
+          set -euo pipefail
+          # TODO(tier2-ios): use fetched keychain + provisioning profile.
+          echo "::error::iOS signed builds require per-tenant setup — see TODO(tier2-ios) in build-app.yml"
+          exit 1
+
+      - name: Build (Android)
+        if: env.PLATFORM == 'android'
+        shell: bash
+        working-directory: work/src-tauri
+        run: |
+          set -euo pipefail
+          # TODO(tier2-android): fill in gradle signing invocation.
+          echo "::error::Android signed builds require per-tenant setup — see TODO(tier2-android) in build-app.yml"
+          exit 1
+
+      # ─── 7. Locate + upload artifact ───────────────────────────────
+      - name: Locate artifact
+        id: locate
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$PLATFORM" in
+            macos)   FILE=$(find work/src-tauri/target/release/bundle/dmg -name '*.dmg' | head -1) ;;
+            windows) FILE=$(find work/src-tauri/target/release/bundle -type f \( -name '*.msi' -o -name '*-setup.exe' \) | head -1) ;;
+            linux)   FILE=$(find work/src-tauri/target/release/bundle -type f \( -name '*.AppImage' -o -name '*.deb' \) | head -1) ;;
+            ios)     FILE=$(find work -type f -name 'artifact.ipa' | head -1) ;;
+            android) FILE=$(find work -type f -name 'artifact.aab' | head -1) ;;
+          esac
+          if [ -z "$FILE" ] || [ ! -f "$FILE" ]; then
+            echo "::error::No artifact found for platform $PLATFORM"
+            exit 1
+          fi
+          echo "file=$FILE" >> "$GITHUB_OUTPUT"
+          echo "name=$(basename "$FILE")" >> "$GITHUB_OUTPUT"
+          echo "sha=$(shasum -a 256 "$FILE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          echo "size=$(stat -c %s "$FILE" 2>/dev/null || stat -f %z "$FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact
+        if: success() && steps.locate.outputs.file
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ env.BUILD_ID }}
+          path: ${{ steps.locate.outputs.file }}
+          retention-days: 14
+
+      # ─── 8. Report completed / failed ─────────────────────────────
+      - name: Report completed
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          FILENAME='${{ steps.locate.outputs.name }}'
+          SHA='${{ steps.locate.outputs.sha }}'
+          SIZE='${{ steps.locate.outputs.size }}'
+          LOGS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BODY="$(jq -n \
+            --arg fn "$FILENAME" --arg sha "$SHA" --arg url "$LOGS_URL" \
+            --arg r "$RUNNER_NAME" --argjson sz "${SIZE:-0}" \
+            '{status:"completed", artifactFilename:$fn, artifactSha256:$sha, artifactSize:$sz, logsUrl:$url, runner:$r}')"
+          SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Build-Signature: $SIG" \
+            -d "$BODY"
+
+      - name: Report failed
+        if: failure()
+        shell: bash
+        run: |
+          set -euo pipefail
+          LOGS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BODY="$(jq -n --arg url "$LOGS_URL" --arg r "$RUNNER_NAME" \
+            '{status:"failed", errorMessage:"See runner logs", logsUrl:$url, runner:$r}')"
+          SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Build-Signature: $SIG" \
+            -d "$BODY" || true
+
+      # ─── 9. Cleanup ────────────────────────────────────────────────
+      # Nuke signing material from the runner disk. `always()` so it
+      # runs on both success and failure paths.
+      - name: Scrub signing material
+        if: always()
+        shell: bash
+        run: |
+          rm -rf work/signing || true
