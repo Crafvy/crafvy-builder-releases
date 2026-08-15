@@ -154,6 +154,13 @@ jobs:
           fetch-depth: 1
 
       # ─── 3. Materialize the per-build Tauri source tree ────────────
+      # Crafvy apps are Tauri SHELLS — a native window that loads a
+      # remote URL. Tauri still needs `build.frontendDist` to point at
+      # a real folder on disk (it packages whatever's there into the
+      # bundle even though runtime just navigates to windows[0].url).
+      # We write a minimal stub HTML there — invisible to end users
+      # (window.url takes over immediately) but keeps `cargo tauri
+      # build` happy.
       - name: Materialize Tauri source
         shell: bash
         run: |
@@ -164,6 +171,20 @@ jobs:
             exit 1
           fi
           cp -R desktop/src-tauri work/src-tauri
+
+          # Write the stub frontendDist ("../dist-<identifier>" resolves
+          # to work/dist-<identifier>/ from work/src-tauri/'s POV).
+          IDENT="$(echo "$DESCRIPTOR_JSON" | jq -r '.identifier')"
+          STUB_DIR="work/dist-$IDENT"
+          mkdir -p "$STUB_DIR"
+          cat > "$STUB_DIR/index.html" <<'HTML'
+          <!doctype html>
+          <meta charset="utf-8">
+          <title>Loading…</title>
+          <style>html,body{margin:0;padding:0;background:#0f0a1a;color:#7c3aed;font:14px system-ui,sans-serif}main{display:grid;place-items:center;height:100vh}</style>
+          <main>Loading…</main>
+          HTML
+
           node -e '
             const fs = require("fs");
             const d = JSON.parse(process.env.DESCRIPTOR_JSON);
@@ -443,7 +464,11 @@ jobs:
           echo "sha=$(shasum -a 256 "$FILE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "size=$(stat -c %s "$FILE" 2>/dev/null || stat -f %z "$FILE")" >> "$GITHUB_OUTPUT"
 
-      - name: Upload artifact
+      # Belt-and-suspenders debugging aid — keep the artifact accessible
+      # in the Actions UI for 14 days regardless of whether the
+      # platform-side upload below succeeds. If the platform upload
+      # ever breaks, the operator can still hand-download from here.
+      - name: Attach artifact to run (debug retention)
         if: success() && steps.locate.outputs.file
         uses: actions/upload-artifact@v4
         with:
@@ -451,7 +476,33 @@ jobs:
           path: ${{ steps.locate.outputs.file }}
           retention-days: 14
 
-      # ─── 8. Report completed / failed ─────────────────────────────
+      # ─── 8. Upload artifact to platform storage ────────────────────
+      # Streams the built binary into the customer's asset storage so
+      # it appears in their Apps folder + counts against their quota +
+      # inherits sharing/version-history/retention. Storage key comes
+      # back in the response and rides along in the completed callback
+      # so registerBuildArtifactAsAsset() can glue the asset row.
+      - name: Upload artifact to platform
+        id: upload
+        if: success() && steps.locate.outputs.file
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIG="$(printf 'artifact.%s' "$BUILD_ID" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          RESP="$(curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/artifact" \
+            -H "X-Build-Signature: $SIG" \
+            -H "X-Build-Runner: $RUNNER_NAME" \
+            -F "file=@${{ steps.locate.outputs.file }}")"
+          STORAGE_KEY="$(echo "$RESP" | jq -r '.data.storageKey')"
+          if [ -z "$STORAGE_KEY" ] || [ "$STORAGE_KEY" = "null" ]; then
+            echo "::error::Platform upload returned no storageKey"
+            echo "$RESP" | head -20
+            exit 1
+          fi
+          echo "storageKey=$STORAGE_KEY" >> "$GITHUB_OUTPUT"
+          echo "Uploaded to $STORAGE_KEY"
+
+      # ─── 9. Report completed / failed ─────────────────────────────
       - name: Report completed
         if: success()
         shell: bash
@@ -460,11 +511,13 @@ jobs:
           FILENAME='${{ steps.locate.outputs.name }}'
           SHA='${{ steps.locate.outputs.sha }}'
           SIZE='${{ steps.locate.outputs.size }}'
+          STORAGE_KEY='${{ steps.upload.outputs.storageKey }}'
           LOGS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           BODY="$(jq -n \
             --arg fn "$FILENAME" --arg sha "$SHA" --arg url "$LOGS_URL" \
-            --arg r "$RUNNER_NAME" --argjson sz "${SIZE:-0}" \
-            '{status:"completed", artifactFilename:$fn, artifactSha256:$sha, artifactSize:$sz, logsUrl:$url, runner:$r}')"
+            --arg r "$RUNNER_NAME" --arg sk "$STORAGE_KEY" \
+            --argjson sz "${SIZE:-0}" \
+            '{status:"completed", artifactFilename:$fn, artifactSha256:$sha, artifactSize:$sz, artifactStorageKey:$sk, logsUrl:$url, runner:$r}')"
           SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
           curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
             -H "Content-Type: application/json" \
