@@ -134,12 +134,16 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          BODY="$(jq -n --arg r "$RUNNER_NAME" '{status:"running", runner:$r}')"
+          # jq -c → compact single-line JSON (no embedded newlines
+          # that a proxy might normalize)
+          # curl --data-binary → send body verbatim, no whitespace
+          # tinkering
+          BODY="$(jq -cn --arg r "$RUNNER_NAME" '{status:"running", runner:$r}')"
           SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
           curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
             -H "Content-Type: application/json" \
             -H "X-Build-Signature: $SIG" \
-            -d "$BODY"
+            --data-binary "$BODY"
 
       # ─── 2. Checkout the private page-builder source tree ─────────
       # `desktop/src-tauri` lives there. Token is a fine-grained PAT
@@ -553,7 +557,7 @@ jobs:
           SIZE='${{ steps.locate.outputs.size }}'
           STORAGE_KEY='${{ steps.upload.outputs.storageKey }}'
           LOGS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          BODY="$(jq -n \
+          BODY="$(jq -cn \
             --arg fn "$FILENAME" --arg sha "$SHA" --arg url "$LOGS_URL" \
             --arg r "$RUNNER_NAME" --arg sk "$STORAGE_KEY" \
             --argjson sz "${SIZE:-0}" \
@@ -562,7 +566,7 @@ jobs:
           curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
             -H "Content-Type: application/json" \
             -H "X-Build-Signature: $SIG" \
-            -d "$BODY"
+            --data-binary "$BODY"
 
       - name: Report failed
         if: failure()
@@ -570,13 +574,13 @@ jobs:
         run: |
           set -euo pipefail
           LOGS_URL="https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
-          BODY="$(jq -n --arg url "$LOGS_URL" --arg r "$RUNNER_NAME" \
+          BODY="$(jq -cn --arg url "$LOGS_URL" --arg r "$RUNNER_NAME" \
             '{status:"failed", errorMessage:"See runner logs", logsUrl:$url, runner:$r}')"
           SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
           curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
             -H "Content-Type: application/json" \
             -H "X-Build-Signature: $SIG" \
-            -d "$BODY" || true
+            --data-binary "$BODY" || true
 
       # ─── 9. Cleanup ────────────────────────────────────────────────
       # Nuke signing material from the runner disk. `always()` so it
