@@ -288,6 +288,10 @@ jobs:
               jq -r '.appStoreConnectKeyId'      work/signing/blob.json > work/signing/key.id
               # provisioning profile only needed for iOS; harmless on macOS
               jq -r '.provisioningProfile // empty' work/signing/blob.json | base64 -d > work/signing/profile.mobileprovision || true
+              # Optional store-submission fields — empty when the
+              # customer hasn't opted in to auto-submit.
+              jq -r '.appStoreConnectIssuerId // empty' work/signing/blob.json > work/signing/issuer.id
+              jq -r '.autoSubmitAfterBuild // false'    work/signing/blob.json > work/signing/auto_submit
               ;;
             google)
               jq -r '.serviceAccountJson' work/signing/blob.json > work/signing/play.json
@@ -295,6 +299,9 @@ jobs:
               jq -r '.keystorePassword'   work/signing/blob.json > work/signing/upload.pw
               jq -r '.keyAlias'           work/signing/blob.json > work/signing/upload.alias
               jq -r '.keyPassword'        work/signing/blob.json > work/signing/upload.keypw
+              jq -r '.packageName // empty'          work/signing/blob.json > work/signing/pkg.name
+              jq -r '.submitTrack   // "internal"'   work/signing/blob.json > work/signing/track
+              jq -r '.autoSubmitAfterBuild // false' work/signing/blob.json > work/signing/auto_submit
               ;;
             macos-developer-id)
               # Direct-distribution macOS signing + notarization
@@ -667,6 +674,105 @@ jobs:
             -H "Content-Type: application/json" \
             -H "X-Build-Signature: $SIG" \
             --data-binary "$BODY" || true
+
+      # ─── 8a. (Optional) Auto-submit signed iOS build to App Store Connect
+      # Triggers when the customer's Apple credential has
+      # autoSubmitAfterBuild=true. Uploads the .ipa via `xcrun altool`
+      # using the API key already fetched for signing. Artifact lands
+      # in App Store Connect ready to promote to TestFlight or submit
+      # for review — the customer still handles review manually.
+      # Failure here doesn't fail the build (the artifact upload
+      # below still runs) — customers can always hand-submit via
+      # Transporter.app later.
+      - name: Submit iOS to App Store Connect (optional)
+        if: success() && env.PLATFORM == 'ios' && env.SIGNED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIGNING="$GITHUB_WORKSPACE/work/signing"
+          if [ "$(cat "$SIGNING/auto_submit" 2>/dev/null)" != "true" ]; then
+            echo "→ autoSubmitAfterBuild=false — skipping App Store Connect upload"
+            exit 0
+          fi
+          ISSUER="$(cat "$SIGNING/issuer.id" 2>/dev/null)"
+          KEY_ID="$(cat "$SIGNING/key.id")"
+          if [ -z "$ISSUER" ]; then
+            echo "::warning::autoSubmitAfterBuild=true but appStoreConnectIssuerId is empty — App Store Connect upload skipped. Add it to your Apple credential."
+            exit 0
+          fi
+          # xcrun altool looks for AuthKey_<KEY_ID>.p8 in this exact
+          # path (or via --apiKeyPath). Copy the fetched .p8 into
+          # place so the flag-form works consistently.
+          KEY_DIR="$HOME/.appstoreconnect/private_keys"
+          mkdir -p "$KEY_DIR"
+          cp "$SIGNING/api.p8" "$KEY_DIR/AuthKey_${KEY_ID}.p8"
+          echo "→ Uploading .ipa to App Store Connect (issuer $ISSUER, key $KEY_ID)"
+          xcrun altool --upload-app \
+            -f "$GITHUB_WORKSPACE/work/artifact.ipa" \
+            -t ios \
+            --apiKey "$KEY_ID" \
+            --apiIssuer "$ISSUER" \
+            || echo "::warning::App Store Connect upload failed — see log above. Customer can still upload manually via Transporter.app from the downloaded artifact."
+
+      # ─── 8b. (Optional) Auto-submit signed Android build to Play Console
+      # Triggers when the customer's Google credential has
+      # autoSubmitAfterBuild=true. Uses the Play Developer API via
+      # a small inline node script. Lands the .aab in the configured
+      # track (default: internal testing — safest first stop).
+      # Same failure semantics as iOS above — best-effort.
+      - name: Submit Android to Play Console (optional)
+        if: success() && env.PLATFORM == 'android' && env.SIGNED == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          SIGNING="$GITHUB_WORKSPACE/work/signing"
+          if [ "$(cat "$SIGNING/auto_submit" 2>/dev/null)" != "true" ]; then
+            echo "→ autoSubmitAfterBuild=false — skipping Play Console upload"
+            exit 0
+          fi
+          PKG="$(cat "$SIGNING/pkg.name" 2>/dev/null)"
+          TRACK="$(cat "$SIGNING/track" 2>/dev/null)"
+          if [ -z "$PKG" ]; then
+            echo "::warning::autoSubmitAfterBuild=true but packageName is empty — Play Console upload skipped. Add it to your Google credential."
+            exit 0
+          fi
+          echo "→ Uploading .aab to Play Console: $PKG (track $TRACK)"
+          npm install --no-save googleapis@144
+          node <<'JS'
+          const {google} = require("googleapis");
+          const fs = require("fs");
+          (async () => {
+            const signing = process.env.GITHUB_WORKSPACE + "/work/signing";
+            const pkg = fs.readFileSync(`${signing}/pkg.name`, "utf8").trim();
+            const track = fs.readFileSync(`${signing}/track`, "utf8").trim() || "internal";
+            const aab = process.env.GITHUB_WORKSPACE + "/work/artifact.aab";
+            const auth = new google.auth.GoogleAuth({
+              keyFile: `${signing}/play.json`,
+              scopes: ["https://www.googleapis.com/auth/androidpublisher"],
+            });
+            const publisher = google.androidpublisher({version: "v3", auth});
+            // Insert edit → upload AAB → assign to track → commit.
+            const edit = await publisher.edits.insert({packageName: pkg});
+            const editId = edit.data.id;
+            const upload = await publisher.edits.bundles.upload({
+              packageName: pkg,
+              editId,
+              media: {mimeType: "application/octet-stream", body: fs.createReadStream(aab)},
+            });
+            const versionCode = upload.data.versionCode;
+            await publisher.edits.tracks.update({
+              packageName: pkg,
+              editId,
+              track,
+              requestBody: {track, releases: [{versionCodes: [String(versionCode)], status: "completed"}]},
+            });
+            await publisher.edits.commit({packageName: pkg, editId});
+            console.log(`✓ Uploaded versionCode ${versionCode} to track ${track}`);
+          })().catch((err) => {
+            console.error("::warning::Play Console upload failed:", err.message);
+            process.exit(0); // best-effort
+          });
+          JS
 
       # Belt-and-suspenders debugging aid — keep the artifact accessible
       # in the Actions UI for 14 days regardless of whether the
