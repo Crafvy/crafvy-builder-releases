@@ -288,9 +288,13 @@ jobs:
               jq -r '.appSpecificPassword'     work/signing/blob.json > work/signing/macos/notary.pw
               ;;
             windows-authenticode)
-              # Reserved — Windows Authenticode signing UI not built yet.
-              echo "::error::Signing platform '$(cat work/signing/platform.txt)' has no runner support yet"
-              exit 1
+              # Windows Authenticode signing (signtool). Materials go
+              # into work/signing/windows/ for the post-build signtool
+              # step to consume.
+              mkdir -p work/signing/windows
+              jq -r '.codeSigningPfx'         work/signing/blob.json | base64 -d > work/signing/windows/cert.pfx
+              jq -r '.codeSigningPfxPassword' work/signing/blob.json > work/signing/windows/cert.pw
+              jq -r '.timestampUrl'           work/signing/blob.json > work/signing/windows/timestamp.url
               ;;
             *)
               echo "::error::Unknown signing platform: $(cat work/signing/platform.txt)"
@@ -390,6 +394,60 @@ jobs:
           fi
 
           cargo tauri build
+
+      # Windows Authenticode signing (post-build, uses signtool).
+      # Only runs when a windows-authenticode credential was attached.
+      # signtool is preinstalled on windows-latest runners.
+      # We sign every .msi + .exe emitted under target/.../bundle/
+      # and timestamp against the URL from the credential so the
+      # signature stays valid past the cert's expiry.
+      - name: Sign Windows artifacts
+        if: success() && env.PLATFORM == 'windows'
+        shell: pwsh
+        working-directory: work/src-tauri
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $signingDir = "$env:GITHUB_WORKSPACE/work/signing/windows"
+          if (-Not (Test-Path "$signingDir/cert.pfx")) {
+            Write-Host "::warning::No windows-authenticode credential attached — .msi / .exe ship UNSIGNED. Users will hit SmartScreen's 'unrecognized publisher' warning. To sign, upload a code-signing PFX via Submit tab."
+            exit 0
+          }
+          $pw = (Get-Content "$signingDir/cert.pw" -Raw).Trim()
+          $timestampUrl = (Get-Content "$signingDir/timestamp.url" -Raw).Trim()
+          if (-Not $timestampUrl) { $timestampUrl = "http://timestamp.digicert.com" }
+          # Find signtool.exe — it ships with the Windows SDK on
+          # windows-latest but isn't on PATH by default.
+          $signtool = Get-ChildItem -Path "C:\Program Files (x86)\Windows Kits\10\bin" -Recurse -Filter "signtool.exe" `
+            | Where-Object { $_.FullName -like "*x64*" } `
+            | Sort-Object FullName -Descending `
+            | Select-Object -First 1 -ExpandProperty FullName
+          if (-Not $signtool) { throw "signtool.exe not found on runner" }
+          Write-Host "Using signtool: $signtool"
+          # Sign all .msi + -setup.exe under bundle/. Two candidate
+          # roots (workspace vs src-tauri) mirroring the artifact
+          # locator step.
+          $roots = @(
+            "target/release/bundle",
+            "../target/release/bundle"
+          )
+          $signed = 0
+          foreach ($root in $roots) {
+            if (-Not (Test-Path $root)) { continue }
+            $files = Get-ChildItem -Path $root -Recurse -Include *.msi,*-setup.exe
+            foreach ($f in $files) {
+              Write-Host "Signing $($f.FullName)"
+              & $signtool sign `
+                /f "$signingDir/cert.pfx" `
+                /p $pw `
+                /tr $timestampUrl `
+                /td sha256 `
+                /fd sha256 `
+                $f.FullName
+              if ($LASTEXITCODE -ne 0) { throw "signtool failed on $($f.FullName)" }
+              $signed++
+            }
+          }
+          Write-Host "Signed $signed artifact(s)"
 
       # iOS build — signed + ready for App Store upload.
       #
