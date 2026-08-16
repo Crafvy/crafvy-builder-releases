@@ -514,6 +514,18 @@ jobs:
             exit 1
           fi
 
+          # 3xx redirect — the platform never got the request. Most
+          # common cause: dev URL is behind coder's / a tunnel's auth
+          # wall that redirects unauthenticated requests to a login
+          # page. Callback JSON POSTs sometimes slip through; multipart
+          # uploads trip stricter proxy code paths.
+          if [ "$STATUS" -ge 300 ] && [ "$STATUS" -lt 400 ]; then
+            echo "::error::Upload got HTTP $STATUS (redirect) — the endpoint is auth-walled or behind a proxy that redirects unauthenticated multipart requests."
+            echo "::error::Fix: (a) mark coder port 3000 as 'Public' in workspace port settings, OR (b) use a public tunnel like cloudflared for NEXT_PUBLIC_APP_URL, OR (c) test from prod."
+            echo "See docs/CI_BUILDS.md 'Testing signed builds from a dev instance' for details."
+            exit 1
+          fi
+
           # Non-2xx JSON — surface the platform's error message.
           if [ "$STATUS" != "200" ]; then
             echo "::error::Upload failed with HTTP $STATUS"
