@@ -230,6 +230,17 @@ jobs:
             console.log("Wrote work/src-tauri/tauri.conf.json for " + d.identifier);
           '
 
+      - name: Report progress (source ready)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY="$(jq -cn --arg r "$RUNNER_NAME" '{status:"running", progress:20, runner:$r}')"
+          SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Build-Signature: $SIG" \
+            --data-binary "$BODY" || true
+
       # ─── 4. Fetch signing material (only if this is a signed build) ─
       # Field names below MUST match what the editor puts into the
       # credential blob — see src/components/apps/app-publication-editor.tsx
@@ -314,6 +325,17 @@ jobs:
           # Match Tauri 2's default NDK target. Pin exact version so a
           # newer Google-released NDK can't shift ABI behavior mid-week.
           packages: 'platform-tools platforms;android-34 build-tools;34.0.0 ndk;27.0.12077973'
+
+      - name: Report progress (toolchains ready)
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY="$(jq -cn --arg r "$RUNNER_NAME" '{status:"running", progress:45, runner:$r}')"
+          SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Build-Signature: $SIG" \
+            --data-binary "$BODY" || true
 
       # ─── 6. Build the platform artifact ────────────────────────────
       - name: Build (desktop)
@@ -467,6 +489,18 @@ jobs:
           echo "name=$(basename "$FILE")" >> "$GITHUB_OUTPUT"
           echo "sha=$(shasum -a 256 "$FILE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "size=$(stat -c %s "$FILE" 2>/dev/null || stat -f %z "$FILE")" >> "$GITHUB_OUTPUT"
+
+      - name: Report progress (build done, uploading)
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          BODY="$(jq -cn --arg r "$RUNNER_NAME" '{status:"running", progress:85, runner:$r}')"
+          SIG="$(printf '%s.%s' "$BUILD_ID" "$BODY" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Build-Signature: $SIG" \
+            --data-binary "$BODY" || true
 
       # Belt-and-suspenders debugging aid — keep the artifact accessible
       # in the Actions UI for 14 days regardless of whether the
