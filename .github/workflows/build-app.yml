@@ -167,6 +167,12 @@ jobs:
       # build` happy.
       - name: Materialize Tauri source
         shell: bash
+        env:
+          # Baked into the app's updater config at build time so
+          # Tauri can verify the signature on any downloaded update.
+          # Optional — when unset, no updater plugin is written and
+          # the shipped binary just doesn't check for updates.
+          TAURI_UPDATER_PUBKEY: ${{ secrets.TAURI_SIGNING_PUBLIC_KEY }}
         run: |
           set -euo pipefail
           mkdir -p work
@@ -219,12 +225,27 @@ jobs:
                 targets: "all",
                 icon: d.iconPaths || ["icons/icon.png"],
               },
-              plugins: {
-                "deep-link": {
-                  desktop: { schemes: [d.deepLinkScheme] },
-                  mobile: [{ scheme: [d.deepLinkScheme] }],
+              plugins: Object.assign(
+                {
+                  "deep-link": {
+                    desktop: { schemes: [d.deepLinkScheme] },
+                    mobile: [{ scheme: [d.deepLinkScheme] }],
+                  },
                 },
-              },
+                // Enable auto-update ONLY when the descriptor
+                // includes an updaterEndpoint AND the workflow has
+                // the matching pubkey. Without both, Tauri would
+                // still poll (broken URL → constant 503s in logs);
+                // safer to omit the plugin entirely.
+                (d.updaterEndpoint && process.env.TAURI_UPDATER_PUBKEY)
+                  ? {
+                      updater: {
+                        endpoints: [d.updaterEndpoint],
+                        pubkey: process.env.TAURI_UPDATER_PUBKEY,
+                      },
+                    }
+                  : {},
+              ),
             };
             fs.writeFileSync("work/src-tauri/tauri.conf.json", JSON.stringify(conf, null, 2));
             console.log("Wrote work/src-tauri/tauri.conf.json for " + d.identifier);
@@ -372,6 +393,16 @@ jobs:
         if: env.PLATFORM == 'macos' || env.PLATFORM == 'windows' || env.PLATFORM == 'linux'
         shell: bash
         working-directory: work/src-tauri
+        env:
+          # Enables Tauri to emit the updater bundle (.tar.gz /
+          # .zip) + matching .sig file next to the installer. The
+          # per-publication updater endpoint inlines this .sig into
+          # every update manifest so the desktop client can verify
+          # the download. Optional — without these, Tauri still
+          # produces installers but auto-update is off for the
+          # resulting binary.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
           cargo install tauri-cli --version '^2' --locked
@@ -576,6 +607,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          # Main installer to ship to end users
           case "$PLATFORM" in
             macos)   FILE=$(find work/src-tauri/target/release/bundle/dmg -name '*.dmg' | head -1) ;;
             windows) FILE=$(find work/src-tauri/target/release/bundle -type f \( -name '*.msi' -o -name '*-setup.exe' \) | head -1) ;;
@@ -591,6 +623,38 @@ jobs:
           echo "name=$(basename "$FILE")" >> "$GITHUB_OUTPUT"
           echo "sha=$(shasum -a 256 "$FILE" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
           echo "size=$(stat -c %s "$FILE" 2>/dev/null || stat -f %z "$FILE")" >> "$GITHUB_OUTPUT"
+
+          # Tauri auto-update sig side-car — emitted alongside the
+          # updater bundle (.app.tar.gz, .msi.zip, .nsis.zip,
+          # .AppImage.tar.gz) when TAURI_SIGNING_PRIVATE_KEY is set.
+          # Different file than the main installer. We ship the
+          # UPDATER BUNDLE (not the .dmg/.msi/.exe) as the download
+          # asset when a sig is present so /api/apps/updater/ has
+          # something it can offer with a signature; the desktop
+          # client resolves the sig side-car by name+".sig".
+          SIG_BUNDLE=""
+          SIG_FILE=""
+          case "$PLATFORM" in
+            macos)
+              SIG_BUNDLE=$(find work/src-tauri/target/release/bundle -type f -name '*.app.tar.gz' | head -1)
+              ;;
+            windows)
+              SIG_BUNDLE=$(find work/src-tauri/target/release/bundle -type f \( -name '*.msi.zip' -o -name '*.nsis.zip' \) | head -1)
+              ;;
+            linux)
+              SIG_BUNDLE=$(find work/src-tauri/target/release/bundle -type f -name '*.AppImage.tar.gz' | head -1)
+              ;;
+          esac
+          if [ -n "$SIG_BUNDLE" ] && [ -f "$SIG_BUNDLE" ] && [ -f "${SIG_BUNDLE}.sig" ]; then
+            SIG_FILE="${SIG_BUNDLE}.sig"
+            echo "→ Tauri updater bundle + .sig detected — auto-update will be available"
+            echo "sigBundle=$SIG_BUNDLE" >> "$GITHUB_OUTPUT"
+            echo "sigBundleName=$(basename "$SIG_BUNDLE")" >> "$GITHUB_OUTPUT"
+            echo "sigFile=$SIG_FILE" >> "$GITHUB_OUTPUT"
+            echo "sigFileName=$(basename "$SIG_FILE")" >> "$GITHUB_OUTPUT"
+          else
+            echo "→ No Tauri updater bundle .sig detected — auto-update disabled for this build (TAURI_SIGNING_PRIVATE_KEY probably not set on this repo)"
+          fi
 
       - name: Report progress (build done, uploading)
         if: success()
@@ -681,6 +745,27 @@ jobs:
           fi
           echo "storageKey=$STORAGE_KEY" >> "$GITHUB_OUTPUT"
           echo "Uploaded to $STORAGE_KEY"
+
+          # If a Tauri updater bundle + .sig exist, upload BOTH as
+          # additional sibling assets (kind=sig-bundle). The updater
+          # endpoint at /api/apps/updater/ finds them by name and
+          # inlines the .sig text into the manifest. Best-effort:
+          # failure here doesn't fail the whole build — the install
+          # link still works, just no auto-update for this version.
+          if [ -n "${{ steps.locate.outputs.sigBundle }}" ]; then
+            for EXTRA in \
+              "${{ steps.locate.outputs.sigBundle }}" \
+              "${{ steps.locate.outputs.sigFile }}"
+            do
+              [ -f "$EXTRA" ] || continue
+              curl -sS -o /dev/null -w '%{http_code}\n' -X POST \
+                "$CRAFVY_URL/api/apps/builds/$BUILD_ID/artifact?sibling=true" \
+                -H "X-Build-Signature: $SIG" \
+                -H "X-Build-Runner: $RUNNER_NAME" \
+                -F "file=@$EXTRA" || true
+            done
+            echo "Sibling updater artifacts uploaded"
+          fi
 
       # ─── 9. Report completed / failed ─────────────────────────────
       - name: Report completed
