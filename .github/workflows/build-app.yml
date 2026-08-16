@@ -489,14 +489,42 @@ jobs:
         run: |
           set -euo pipefail
           SIG="$(printf 'artifact.%s' "$BUILD_ID" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
-          RESP="$(curl -fSs -X POST "$CRAFVY_URL/api/apps/builds/$BUILD_ID/artifact" \
+
+          # Capture status + body separately so we can log both
+          # regardless of outcome. `-o` writes body to a file, `-w`
+          # dumps the HTTP status. NO `-f` — we want to see 4xx/5xx
+          # bodies, not have curl swallow them.
+          BODY_FILE="$(mktemp)"
+          STATUS="$(curl -sS -o "$BODY_FILE" -w '%{http_code}' -X POST \
+            "$CRAFVY_URL/api/apps/builds/$BUILD_ID/artifact" \
             -H "X-Build-Signature: $SIG" \
             -H "X-Build-Runner: $RUNNER_NAME" \
             -F "file=@${{ steps.locate.outputs.file }}")"
-          STORAGE_KEY="$(echo "$RESP" | jq -r '.data.storageKey')"
-          if [ -z "$STORAGE_KEY" ] || [ "$STORAGE_KEY" = "null" ]; then
-            echo "::error::Platform upload returned no storageKey"
-            echo "$RESP" | head -20
+          BODY="$(cat "$BODY_FILE")"
+          rm -f "$BODY_FILE"
+
+          # Response type diagnostic — HTML back means Next served a
+          # 404/500 error page (route not compiled / thrown error).
+          FIRST_CHAR="$(printf '%s' "$BODY" | head -c 1)"
+          if [ "$FIRST_CHAR" = "<" ]; then
+            echo "::error::Upload endpoint returned HTML (status $STATUS) — likely a Next 404 (route missing / not compiled) or 500 (server error). First 400 chars:"
+            echo "$BODY" | head -c 400
+            echo
+            echo "::error::Check that /api/apps/builds/[id]/artifact/route.ts exists and pnpm dev has picked it up (restart dev if just created)."
+            exit 1
+          fi
+
+          # Non-2xx JSON — surface the platform's error message.
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Upload failed with HTTP $STATUS"
+            echo "$BODY" | head -c 2000
+            exit 1
+          fi
+
+          STORAGE_KEY="$(echo "$BODY" | jq -r '.data.storageKey // empty')"
+          if [ -z "$STORAGE_KEY" ]; then
+            echo "::error::Upload returned 200 but no storageKey in response body:"
+            echo "$BODY" | head -c 2000
             exit 1
           fi
           echo "storageKey=$STORAGE_KEY" >> "$GITHUB_OUTPUT"
