@@ -275,10 +275,20 @@ jobs:
               jq -r '.keyAlias'           work/signing/blob.json > work/signing/upload.alias
               jq -r '.keyPassword'        work/signing/blob.json > work/signing/upload.keypw
               ;;
-            macos-developer-id|windows-authenticode)
-              # Reserved for future signing platforms — desktop code-sign
-              # variants that don't go through App Store. Cred structure
-              # will be defined when we add UI for them.
+            macos-developer-id)
+              # Direct-distribution macOS signing + notarization
+              # (not App Store). Materials go into work/signing/macos/
+              # for the desktop build step to consume as env vars.
+              mkdir -p work/signing/macos
+              jq -r '.developerIdCertP12'      work/signing/blob.json > work/signing/macos/cert.p12.b64
+              jq -r '.developerIdCertPassword' work/signing/blob.json > work/signing/macos/cert.pw
+              jq -r '.signingIdentity'         work/signing/blob.json > work/signing/macos/identity
+              jq -r '.teamId'                  work/signing/blob.json > work/signing/macos/team.id
+              jq -r '.appleId'                 work/signing/blob.json > work/signing/macos/apple.id
+              jq -r '.appSpecificPassword'     work/signing/blob.json > work/signing/macos/notary.pw
+              ;;
+            windows-authenticode)
+              # Reserved — Windows Authenticode signing UI not built yet.
               echo "::error::Signing platform '$(cat work/signing/platform.txt)' has no runner support yet"
               exit 1
               ;;
@@ -338,6 +348,22 @@ jobs:
             --data-binary "$BODY" || true
 
       # ─── 6. Build the platform artifact ────────────────────────────
+      # Desktop build.
+      #
+      # macOS signing model:
+      # The build is signed + notarized IFF the caller attached a
+      # macos-developer-id signing credential (any org — Crafvy's own
+      # cert for hub apps, or the customer's for their project apps).
+      # No platform secrets involved — everything goes through the
+      # per-org encrypted-at-rest credential system. That makes
+      # rotation UI-driven, keeps customer attribution correct in
+      # Gatekeeper ("Downloaded from Customer Inc", not "Crafvy Corp"),
+      # and sidesteps Apple 4.3's "many similar apps under one ID"
+      # revocation risk.
+      #
+      # When no such credential is attached, macOS ships unsigned +
+      # gets a workflow warning. Users hit Gatekeeper's "damaged"
+      # prompt until they add and select a credential.
       - name: Build (desktop)
         if: env.PLATFORM == 'macos' || env.PLATFORM == 'windows' || env.PLATFORM == 'linux'
         shell: bash
@@ -345,6 +371,24 @@ jobs:
         run: |
           set -euo pipefail
           cargo install tauri-cli --version '^2' --locked
+
+          # If a macos-developer-id credential was fetched, materialize
+          # it into the env vars Tauri picks up during `cargo tauri
+          # build`. Cred material lives under $GITHUB_WORKSPACE/work/
+          # signing/macos/ (see the Fetch signing material step).
+          SIGNING_MACOS="$GITHUB_WORKSPACE/work/signing/macos"
+          if [ "$PLATFORM" = "macos" ] && [ -f "$SIGNING_MACOS/cert.p12.b64" ]; then
+            echo "→ macos-developer-id credential attached — building SIGNED + notarized macOS bundle"
+            export APPLE_CERTIFICATE="$(cat "$SIGNING_MACOS/cert.p12.b64")"
+            export APPLE_CERTIFICATE_PASSWORD="$(cat "$SIGNING_MACOS/cert.pw")"
+            export APPLE_SIGNING_IDENTITY="$(cat "$SIGNING_MACOS/identity")"
+            export APPLE_ID="$(cat "$SIGNING_MACOS/apple.id")"
+            export APPLE_TEAM_ID="$(cat "$SIGNING_MACOS/team.id")"
+            export APPLE_PASSWORD="$(cat "$SIGNING_MACOS/notary.pw")"
+          elif [ "$PLATFORM" = "macos" ]; then
+            echo "::warning::No macos-developer-id credential attached — producing an UNSIGNED .dmg. Users will hit Gatekeeper's 'damaged' warning. To sign, upload a Developer ID cert via Submit tab and select it when starting the build. See docs/CI_BUILDS.md."
+          fi
+
           cargo tauri build
 
       # iOS build — signed + ready for App Store upload.
