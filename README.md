@@ -23,4 +23,4 @@ Bugs, feature requests, and support belong at
 ## License
 
 Release artifacts are distributed under the Crafvy End-User License
-Agreement. See [crafvy.com/legal](https://crafvy.com/legal).
+Agreement. See [crafvy.com/legal](https://crafvy.com/legal).ABC
