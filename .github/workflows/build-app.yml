@@ -198,12 +198,19 @@ jobs:
           node -e '
             const fs = require("fs");
             const d = JSON.parse(process.env.DESCRIPTOR_JSON);
+            const updater = !!(d.updaterEndpoint && process.env.TAURI_UPDATER_PUBKEY);
             const conf = {
               productName: d.productName,
               version: d.version,
               identifier: d.identifier,
               build: { frontendDist: `../dist-${d.identifier}` },
               app: {
+                // The dashboard reaches the app through window.__TAURI__
+                // (src/lib/desktop-sync.ts, recording). Without this the
+                // bridge is missing and sync/recording never work in a
+                // released build. Commands stay limited to the app host by
+                // the capabilities (desktop/src-tauri/capabilities).
+                withGlobalTauri: true,
                 windows: [{
                   title: d.window.title,
                   width: d.window.width,
@@ -215,21 +222,41 @@ jobs:
                 }],
                 security: {
                   csp: [
-                    "default-src ${d.startUrl}",
+                    // A template literal: as a "…" string this was the
+                    // literal text ${d.startUrl}. (\u0027 = a quote, since
+                    // this script sits in a single-quoted shell string.)
+                    `default-src \u0027self\u0027 ${new URL(d.startUrl).origin}`,
                     ...(d.cspAllowedOrigins || []),
                   ].join(" ")
                 },
               },
-              bundle: {
-                active: true,
-                targets: "all",
-                icon: d.iconPaths || ["icons/icon.png"],
-              },
+              bundle: Object.assign(
+                {
+                  active: true,
+                  targets: "all",
+                  icon: d.iconPaths || ["icons/icon.png"],
+                  // A Windows installer takes major/minor <= 255 only (a
+                  // 2026.10.x version refused to bundle); the stores want a
+                  // number that grows with every upload. Both are worked
+                  // out on the platform (src/lib/apps/build-version.ts).
+                  windows: d.msiVersion ? { wix: { version: d.msiVersion } } : {},
+                  android: d.buildNumber ? { versionCode: d.buildNumber } : {},
+                  iOS: d.buildNumber ? { bundleVersion: String(d.buildNumber) } : {},
+                },
+                // Tauri 2 writes the updater bundle and its .sig ONLY with
+                // this set (default false). "v1Compatible" = .app.tar.gz /
+                // .msi.zip / .nsis.zip / .AppImage.tar.gz, which the Locate
+                // step below looks for; without it no .sig exists and the
+                // update endpoint can never offer this build.
+                updater ? { createUpdaterArtifacts: "v1Compatible" } : {},
+              ),
               plugins: Object.assign(
                 {
                   "deep-link": {
                     desktop: { schemes: [d.deepLinkScheme] },
-                    mobile: [{ scheme: [d.deepLinkScheme] }],
+                    // A custom scheme is not an https App Link: without
+                    // appLink:false Android asks to verify it as one.
+                    mobile: [{ scheme: [d.deepLinkScheme], appLink: false }],
                   },
                 },
                 // Enable auto-update ONLY when the descriptor
@@ -237,7 +264,7 @@ jobs:
                 // the matching pubkey. Without both, Tauri would
                 // still poll (broken URL → constant 503s in logs);
                 // safer to omit the plugin entirely.
-                (d.updaterEndpoint && process.env.TAURI_UPDATER_PUBKEY)
+                updater
                   ? {
                       updater: {
                         endpoints: [d.updaterEndpoint],
@@ -261,6 +288,33 @@ jobs:
             -H "Content-Type: application/json" \
             -H "X-Build-Signature: $SIG" \
             --data-binary "$BODY" || true
+
+      # ─── 3b. The app's own icon ─────────────────────────────────────
+      # The platform hands out the publication's icon as a 1024 px PNG
+      # (/api/apps/builds/{id}/icon). Each build step below runs
+      # `cargo tauri icon` on it after its init, which writes the desktop
+      # set into icons/ and the phone sets into gen/android and gen/apple.
+      # No icon, or none to get: the Crafvy icons in the source tree stay.
+      - name: Fetch app icon
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$(echo "$DESCRIPTOR_JSON" | jq -r '.hasIcon // false')" != "true" ]; then
+            echo "→ No icon of its own — building with the Crafvy icons"
+            exit 0
+          fi
+          SIG="$(printf 'icon.%s' "$BUILD_ID" | openssl dgst -sha256 -hmac "$CRAFVY_SECRET" -r | cut -d' ' -f1)"
+          STATUS="$(curl -sS -o work/app-icon.png -w '%{http_code}' \
+            "$CRAFVY_URL/api/apps/builds/$BUILD_ID/icon" \
+            -H "X-Build-Signature: $SIG" || echo 000)"
+          if [ "$STATUS" = "200" ] && [ -s work/app-icon.png ]; then
+            echo "APP_ICON=$GITHUB_WORKSPACE/work/app-icon.png" >> "$GITHUB_ENV"
+            echo "APP_ICON_BG=$(echo "$DESCRIPTOR_JSON" | jq -r '.iconBackground // "#ffffff"')" >> "$GITHUB_ENV"
+            echo "→ Using the app's own icon"
+          else
+            rm -f work/app-icon.png
+            echo "::warning::The app's icon could not be fetched (HTTP $STATUS) — building with the Crafvy icons"
+          fi
 
       # ─── 4. Fetch signing material (only if this is a signed build) ─
       # Field names below MUST match what the editor puts into the
@@ -431,6 +485,10 @@ jobs:
             echo "::warning::No macos-developer-id credential attached — producing an UNSIGNED .dmg. Users will hit Gatekeeper's 'damaged' warning. To sign, upload a Developer ID cert via Submit tab and select it when starting the build. See docs/CI_BUILDS.md."
           fi
 
+          if [ -n "${APP_ICON:-}" ]; then
+            cargo tauri icon "$APP_ICON" --ios-color "$APP_ICON_BG"
+          fi
+
           cargo tauri build
 
       # Windows Authenticode signing (post-build, uses signtool).
@@ -516,6 +574,10 @@ jobs:
         run: |
           set -euo pipefail
           SIGNING="$GITHUB_WORKSPACE/work/signing"
+          if [ ! -s "$SIGNING/cert.p12" ]; then
+            echo "::error::An iOS build needs an Apple signing credential (distribution certificate, provisioning profile, team). Add one under Store submission and start the build again."
+            exit 1
+          fi
 
           # 1. Ephemeral keychain
           KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain"
@@ -553,8 +615,14 @@ jobs:
           # 4. Build
           cargo install tauri-cli --version '^2' --locked
           export APPLE_DEVELOPMENT_TEAM="$(cat "$SIGNING/team.id")"
-          cargo tauri ios init
-          cargo tauri ios build --export-method app-store
+          # gen/apple in the source tree is the desktop app's own scaffold
+          # (its name and bundle id): generate this app's from its config.
+          rm -rf gen/apple
+          cargo tauri ios init --ci
+          if [ -n "${APP_ICON:-}" ]; then
+            cargo tauri icon "$APP_ICON" --ios-color "$APP_ICON_BG"
+          fi
+          cargo tauri ios build --export-method app-store-connect
 
           # 5. Stage .ipa for the upload step
           IPA="$(find gen/apple -type f -name '*.ipa' | head -1)"
@@ -568,14 +636,16 @@ jobs:
 
       # Android build — signed .aab ready for Play Console.
       #
-      # ubuntu runner with Android SDK/NDK installed above. Signing is
-      # pure gradle — pass the JKS + credentials via -Pandroid.injected
-      # properties which the Android Gradle Plugin picks up.
+      # `cargo tauri android build` compiles the Rust library first, which
+      # writes gen/android/tauri.settings.gradle and the app's
+      # tauri.build.gradle.kts; gradle cannot even read its settings
+      # without them, which is why calling ./gradlew straight after init
+      # failed. The bundle comes out unsigned and is signed with jarsigner
+      # (an .aab is signed like a jar) using the Play upload key.
       #
       # Per-tenant knobs:
       #   - Play upload track ("internal" / "alpha" / "beta" /
-      #     "production") not automated here; customer uploads the .aab
-      #     via Play Console UI or a follow-up step using play.json.
+      #     "production") — see the submit step below.
       - name: Build (Android)
         if: env.PLATFORM == 'android'
         shell: bash
@@ -583,27 +653,43 @@ jobs:
         run: |
           set -euo pipefail
           SIGNING="$GITHUB_WORKSPACE/work/signing"
-
-          # Tauri regenerates gen/android/ on init; safe to run each
-          # build. --ci makes tauri skip interactive prompts.
-          cargo install tauri-cli --version '^2' --locked
-          cargo tauri android init --ci
-
-          # Build the release bundle (.aab) with signing injected.
-          # Gradle properties are read by AGP's release variant.
-          cd gen/android
-          ./gradlew bundleRelease \
-            "-Pandroid.injected.signing.store.file=$SIGNING/upload.jks" \
-            "-Pandroid.injected.signing.store.password=$(cat "$SIGNING/upload.pw")" \
-            "-Pandroid.injected.signing.key.alias=$(cat "$SIGNING/upload.alias")" \
-            "-Pandroid.injected.signing.key.password=$(cat "$SIGNING/upload.keypw")"
-
-          AAB="$(find app/build/outputs/bundle -type f -name '*.aab' | head -1)"
-          if [ -z "$AAB" ]; then
-            echo "::error::Android build produced no .aab. Search paths:"
-            find app/build/outputs -type f -maxdepth 5 | head -50 || true
+          if [ ! -s "$SIGNING/upload.jks" ]; then
+            echo "::error::An Android build needs a Google Play upload key (keystore, alias, passwords). Add one under Store submission and start the build again."
             exit 1
           fi
+
+          # The NDK installed above, not whichever the image happens to
+          # carry newest.
+          SDK="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-}}"
+          if [ -n "$SDK" ] && [ -d "$SDK/ndk/27.0.12077973" ]; then
+            export NDK_HOME="$SDK/ndk/27.0.12077973"
+          fi
+
+          cargo install tauri-cli --version '^2' --locked
+          cargo tauri android init --ci
+          if [ -n "${APP_ICON:-}" ]; then
+            cargo tauri icon "$APP_ICON" --ios-color "$APP_ICON_BG"
+          fi
+          cargo tauri android build --aab --ci
+
+          AAB="$(find gen/android/app/build/outputs/bundle -type f -name '*.aab' | head -1)"
+          if [ -z "$AAB" ]; then
+            echo "::error::Android build produced no .aab. Search paths:"
+            find gen/android/app/build/outputs -type f -maxdepth 5 | head -50 || true
+            exit 1
+          fi
+
+          # Passwords from files, never on the command line. An empty key
+          # password means the key shares the keystore's.
+          KEYPW="$SIGNING/upload.keypw"
+          if [ ! -s "$KEYPW" ] || [ "$(head -1 "$KEYPW")" = "null" ]; then KEYPW="$SIGNING/upload.pw"; fi
+          jarsigner -sigalg SHA256withRSA -digestalg SHA-256 \
+            -keystore "$SIGNING/upload.jks" \
+            -storepass:file "$SIGNING/upload.pw" \
+            -keypass:file "$KEYPW" \
+            "$AAB" "$(cat "$SIGNING/upload.alias")"
+          jarsigner -verify "$AAB" | grep "jar verified" > /dev/null
+
           mkdir -p "$GITHUB_WORKSPACE/work"
           cp "$AAB" "$GITHUB_WORKSPACE/work/artifact.aab"
 
