@@ -863,6 +863,8 @@ jobs:
       # Transporter.app later.
       - name: Submit iOS to App Store Connect (optional)
         if: success() && env.PLATFORM == 'ios' && env.SIGNED == 'true'
+        # Best-effort: a failed store upload never costs the build itself.
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -899,6 +901,8 @@ jobs:
       # Same failure semantics as iOS above — best-effort.
       - name: Submit Android to Play Console (optional)
         if: success() && env.PLATFORM == 'android' && env.SIGNED == 'true'
+        # Best-effort: a failed store upload never costs the build itself.
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -914,7 +918,19 @@ jobs:
             exit 0
           fi
           echo "→ Uploading .aab to Play Console: $PKG (track $TRACK)"
-          npm install --no-save googleapis@144
+          # In a folder of its own: the workspace root is the page-builder
+          # checkout, and an npm install there resolves the platform's whole
+          # dependency tree (and refuses on its peer pins) just to add one
+          # package. A failure here must not fail the build either — the
+          # .aab is built and still has to reach the platform below.
+          PLAY_TOOLS="$RUNNER_TEMP/play-upload"
+          mkdir -p "$PLAY_TOOLS"
+          cd "$PLAY_TOOLS"
+          printf '{"name":"play-upload","private":true}\n' > package.json
+          if ! npm install --no-audit --no-fund --loglevel=error googleapis@144; then
+            echo "::warning::Could not install the Play upload client — Play Console upload skipped. Upload the .aab by hand from the build's download."
+            exit 0
+          fi
           node <<'JS'
           const {google} = require("googleapis");
           const fs = require("fs");
