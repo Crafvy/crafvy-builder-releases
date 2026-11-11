@@ -609,10 +609,53 @@ jobs:
           # gen/apple in the source tree is the desktop app's own scaffold
           # (its name and bundle id): generate this app's from its config.
           rm -rf gen/apple
+          # Passkeys and sign-in links in the app need Associated Domains:
+          # webcredentials:<host> (passkeys in the web view) and
+          # applinks:<host> (the deep-link plugin adds it from an app-link
+          # entry). Signing refuses an entitlement the profile lacks, so
+          # both only when the profile carries the capability — switched on
+          # for the App ID at developer.apple.com, profile made afterwards.
+          LINK_HOST="$(echo "$DESCRIPTOR_JSON" | jq -r '.appLinkHost // empty')"
+          LINK_PATH="$(echo "$DESCRIPTOR_JSON" | jq -r '.appLinkPath // empty')"
+          security cms -D -i "$SIGNING/profile.mobileprovision" > "$RUNNER_TEMP/profile.plist"
+          ASSOCIATED=0
+          if [ -n "$LINK_HOST" ] && /usr/libexec/PlistBuddy -c "Print :Entitlements:com.apple.developer.associated-domains" "$RUNNER_TEMP/profile.plist" >/dev/null 2>&1; then
+            ASSOCIATED=1
+            jq --arg h "$LINK_HOST" --arg p "$LINK_PATH" \
+              '.plugins["deep-link"].mobile += [{scheme: ["https"], host: $h, pathPrefix: [$p], appLink: true}]' \
+              tauri.conf.json > tauri.conf.json.tmp && mv tauri.conf.json.tmp tauri.conf.json
+          elif [ -n "$LINK_HOST" ]; then
+            echo "::warning::The provisioning profile has no Associated Domains — in the app, passkeys and sign-in links go through Safari. Switch the capability on for the App ID, make the profile again and upload it."
+          fi
+
           cargo tauri ios init --ci
           if [ -n "${APP_ICON:-}" ]; then
             cargo tauri icon "$APP_ICON" --ios-color "$APP_ICON_BG"
           fi
+          if [ "$ASSOCIATED" = "1" ]; then
+            ENT="$(find gen/apple -name '*_iOS.entitlements' | head -1)"
+            if [ -n "$ENT" ]; then
+              /usr/libexec/PlistBuddy -c "Add :com.apple.developer.associated-domains array" "$ENT" 2>/dev/null || true
+              /usr/libexec/PlistBuddy -c "Add :com.apple.developer.associated-domains:0 string webcredentials:$LINK_HOST" "$ENT"
+              echo "Associated Domains: webcredentials:$LINK_HOST (+ applinks from the deep-link plugin)"
+            fi
+          fi
+          # Export compliance, answered in the app itself: the app uses no
+          # encryption beyond the system's HTTPS, which is exempt. Without
+          # the key App Store Connect holds every build at "Missing
+          # Compliance" — testers see "No builds available" — until someone
+          # answers the question by hand. Tauri merges Info.ios.plist into the
+          # generated Info.plist.
+          cat > Info.ios.plist <<'PLIST'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict>
+            <key>ITSAppUsesNonExemptEncryption</key>
+            <false/>
+          </dict>
+          </plist>
+          PLIST
           cargo tauri ios build --export-method app-store-connect
 
           # 5. Stage .ipa for the upload step
@@ -656,11 +699,68 @@ jobs:
             export NDK_HOME="$SDK/ndk/27.0.12077973"
           fi
 
+          # A hub app's sign-in links (/auth/app-link/<hub>/…) open the app
+          # as App Links; Android verifies them against the platform's
+          # /.well-known/assetlinks.json (lib/apps/app-association). The
+          # deep-link plugin writes the intent filter from this config.
+          LINK_HOST="$(echo "$DESCRIPTOR_JSON" | jq -r '.appLinkHost // empty')"
+          LINK_PATH="$(echo "$DESCRIPTOR_JSON" | jq -r '.appLinkPath // empty')"
+          if [ -n "$LINK_HOST" ] && [ -n "$LINK_PATH" ]; then
+            jq --arg h "$LINK_HOST" --arg p "$LINK_PATH" \
+              '.plugins["deep-link"].mobile += [{scheme: ["https"], host: $h, pathPrefix: [$p], appLink: true}]' \
+              tauri.conf.json > tauri.conf.json.tmp && mv tauri.conf.json.tmp tauri.conf.json
+          fi
+
           cargo install tauri-cli --version '^2' --locked
           cargo tauri android init --ci
           if [ -n "${APP_ICON:-}" ]; then
             cargo tauri icon "$APP_ICON" --ios-color "$APP_ICON_BG"
           fi
+
+          # Passkeys in the web view: Android's WebView answers WebAuthn
+          # only when the app switches it on (Jetpack WebKit) and the site
+          # names the app in its assetlinks.json (get_login_creds). The
+          # hook is wry's WryActivity.onWebViewCreate.
+          ACTIVITY="$(find gen/android/app/src/main -name MainActivity.kt | head -1)"
+          GRADLE="gen/android/app/build.gradle.kts"
+          if [ -n "$ACTIVITY" ] && [ -f "$GRADLE" ]; then
+            python3 - "$ACTIVITY" "$GRADLE" <<'PY'
+          import re, sys
+          activity, gradle = sys.argv[1], sys.argv[2]
+          src = open(activity).read()
+          if "setWebAuthenticationSupport" not in src:
+              imports = ("import android.webkit.WebView\n"
+                         "import androidx.webkit.WebSettingsCompat\n"
+                         "import androidx.webkit.WebViewFeature\n")
+              src = re.sub(r"^(package [^\n]+\n)", lambda m: m.group(1) + "\n" + imports, src, count=1, flags=re.M)
+              hook = ("\n  override fun onWebViewCreate(webView: WebView) {\n"
+                      "    super.onWebViewCreate(webView)\n"
+                      "    if (WebViewFeature.isFeatureSupported(WebViewFeature.WEB_AUTHENTICATION)) {\n"
+                      "      WebSettingsCompat.setWebAuthenticationSupport(\n"
+                      "        webView.settings, WebSettingsCompat.WEB_AUTHENTICATION_SUPPORT_FOR_APP)\n"
+                      "    }\n"
+                      "  }\n")
+              cut = src.rstrip().rfind("}")
+              src = src[:cut] + hook + "}\n"
+              open(activity, "w").write(src)
+          # The passkey switch needs androidx.webkit 1.14 or newer; Tauri's
+          # template may carry an older one.
+          g = open(gradle).read()
+          want = (1, 14, 0)
+          m = re.search(r'androidx\.webkit:webkit:(\d+(?:\.\d+)*)', g)
+          if m:
+              have = tuple(int(x) for x in m.group(1).split("."))
+              if have < want:
+                  g = g.replace(m.group(0), "androidx.webkit:webkit:1.14.0")
+          else:
+              g = re.sub(r"dependencies\s*\{", 'dependencies {\n    implementation("androidx.webkit:webkit:1.14.0")', g, count=1)
+          open(gradle, "w").write(g)
+          PY
+            echo "Passkeys enabled in the web view ($ACTIVITY)"
+          else
+            echo "::warning::MainActivity.kt or app/build.gradle.kts not found — passkeys stay off in the web view."
+          fi
+
           cargo tauri android build --aab --ci
 
           AAB="$(find gen/android/app/build/outputs/bundle -type f -name '*.aab' | head -1)"
